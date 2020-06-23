@@ -153,7 +153,6 @@ def file_processing(fn, options):
             thread.join()
         while not result_queue.empty():
             results = result_queue.get(TIMEOUT)
-            print(results)
             processed += results[0]
             errors += results[1]
 
