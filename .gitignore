@@ -1,3 +1,4 @@
 /data
 *.pdf
 /memcached_assignment
+*.pyc
