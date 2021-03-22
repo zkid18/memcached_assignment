@@ -7,12 +7,9 @@ import glob
 import logging
 import collections
 from optparse import OptionParser
-# brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
-# pip install protobuf
 import appsinstalled_pb2
-# pip install python-memcached
-import memcache
+import pymemcache
 from multiprocessing import Pool, TimeoutError
 from threading import Thread
 from queue import Queue, Empty
@@ -22,14 +19,34 @@ AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "
 
 TIMEOUT = 0.1
 CONNECT_TIMEOUT = 5
+SENTINEL = object()
+
 
 def dot_rename(path):
     head, fn = os.path.split(path)
     # atomic in most cases
     os.rename(path, os.path.join(head, "." + fn))
 
-class MemchaedThread(Thread):
+class MemcachedThread(Thread):
+    """
+    MemcachedTread
+
+    Creates the Client for a single memcached server.
+    """
     def __init__(self, job_queue, result_queue, memc, dry_run=False, attemps = 1):
+        """
+        Constructor.
+
+        Args:
+            job_queue: Queue
+            result_queue: Queue
+            memc: Memcache client
+            dry_run: Store True
+            attemps: attemps to restart
+        
+        Notes:
+
+        """
         super().__init__()
         self.job_queue = job_queue
         self.result_queue = result_queue
@@ -40,42 +57,45 @@ class MemchaedThread(Thread):
 
     def run(self):
         '''
-        Override the run() method to specify an activity
+        Run Writer
         '''
         logging.debug("Worker [{}] starts thread {}".format(os.getpid(), self.name))
-        try:
-            batches = self.job_queue.get(timeout=TIMEOUT)
-            processed = errors = 0
-            ok = self.insert_appsinstalled(batches)
-            if ok:
-                processed += 1
-            else:
-                errors += 1
-            self.result_queue.put((processed, errors))
-        except Empty:
-            pass
+        processed = errors = 0
+        while True:
+            try:
+                chunks = self.job_queue.get(timeout=0.1)
+                if chunks == SENTINEL:
+                    self.result_queue.put((processed, errors))
+                    logging.info('[Worker %s] Stop thread: %s' % (os.getpid(), self.name))
+                    break
+                else:
+                    proc_items, err_items = self.insert_appsinstalled(chunks)
+                    processed += proc_items
+                    errors += err_items
+            except Empty:
+                continue
         
 
     def insert_appsinstalled(self, batches):
+        processed = errors = 0
         try:
             if self.dry_run:
                 for key, values in batches.items():
                     logging.debug("{} - {} -> {}".format(self.memc, key, values))
+                    processed += 1
             else:
-                self.memcached_set(batches)
+                for key, value in batches.items():
+                    self.memc.set(key, value)
         except Exception as e:
             logging.exception("Cannot write to memc {}: {}".format(self.memc.servers[0], e))
-            return False
-        return True
-
-    def memcached_set(self, batches):
-        for key, value in batches.items():
-            self.memc.set(key, value)
+            errors += 1
+            return processed, errors
+        return processed, errors
 
 
 
 def parse_appsinstalled(line):
-    line_parts = line.decode('utf-8').strip().split("\t")
+    line_parts = line.strip().split("\t")
     if len(line_parts) < 5:
         return
     dev_type, dev_id, lat, lon, raw_apps = line_parts
@@ -100,10 +120,21 @@ def serializeapp(appsinstalled):
     key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
     ua.apps.extend(appsinstalled.apps)
     packed = ua.SerializeToString()
+    # print("ser", key, packed)
     return key, packed
 
 
 def file_processing(fn, options):
+    '''
+    Create thread_pool for every new task
+    Every thread exits after completing the task. 
+
+    To overcome the problem of so many threads, creat ehte pool of threads
+    for each task to execute execute another task when it is finished (so long as there are more tasks to run).  
+
+    When all tasks are done, we must tell the threads to exit. 
+    We paass in a special SENTINEL argument that is different from any argument that the caller could pass.
+    '''
     device_memc = {
         "idfa": options.idfa,
         "gaid": options.gaid,
@@ -114,25 +145,26 @@ def file_processing(fn, options):
     thread_pool = {}
     job_pool = {}
     result_queue = Queue()
-    batches = {}
+    chunks = {}
 
     for device_type, memc_addr in device_memc.items():
-        memc = memcache.Client([memc_addr])
+        memc = pymemcache.Client([memc_addr], timeout=TIMEOUT)
         job_pool[device_type] = Queue()
-        worker = MemchaedThread(job_pool[device_type], 
+        worker = MemcachedThread(job_pool[device_type], 
                                 result_queue,
                                 memc, 
                                 options.dry,
                                 )
         thread_pool[device_type] = worker
-        batches[device_type] = {}
+        chunks[device_type] = {}
         worker.start()
 
-
+    logging.info('[Worker %s] Processing %s' % (os.getpid(), fn))
     fd = gzip.open(fn)
     processed = errors = 0
+
     for line in fd:
-        line = line.strip()
+        line = line.decode().strip()
         if not line:
             continue
         appsinstalled = parse_appsinstalled(line)
@@ -144,30 +176,39 @@ def file_processing(fn, options):
             errors += 1
             logging.error("Unknow device type: %s" % appsinstalled.dev_type)
             continue
+            
         key, packed = serializeapp(appsinstalled)
-        batch = batches[device_type]
-        batch[key] = packed
-        if batch:
-            job_pool[device_type].put(batch)
-        for thread in thread_pool.values():
-            thread.join()
-        while not result_queue.empty():
-            results = result_queue.get(TIMEOUT)
-            processed += results[0]
-            errors += results[1]
+        chunk = chunks[device_type]
+        chunk[key] = packed
 
-        if not processed:
-            fd.close()
-            dot_rename(fn)
-            return fn
+    for dev_type, chunk in chunks.items():
+        if chunk:
+            job_pool[dev_type].put(chunk)
 
-        err_rate = float(errors) / processed
-        if err_rate < NORMAL_ERR_RATE:
-            logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
-        else:
-            logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+    for queue in job_pool.values():
+        queue.put(SENTINEL)
+
+    for thread in thread_pool.values():
+        # to ensure that all threads have finished, call join 
+        thread.join()
+    
+    while not result_queue.empty():
+        result = result_queue.get(timeout=0.1)
+        processed += result[0]
+        errors += result[1]
+
+    if not processed:
         fd.close()
+        # dot_rename(fn)
         return fn
+
+    err_rate = float(errors) / processed
+    if err_rate < NORMAL_ERR_RATE:
+        logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+    else:
+        logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+    fd.close()
+    return fn
 
 
 def prototest():
@@ -196,8 +237,9 @@ def main(options):
                         for file_name in sorted(glob.iglob(options.pattern))
                         )
         for fn in pool.starmap(file_processing, process_args):
+            file_processing(fn, options)
             logging.info('Renaming %s' % fn)
-            dot_rename(fn)
+            # dot_rename(fn)
 
 
 if __name__ == '__main__':
