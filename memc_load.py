@@ -120,7 +120,6 @@ def serializeapp(appsinstalled):
     key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
     ua.apps.extend(appsinstalled.apps)
     packed = ua.SerializeToString()
-    # print("ser", key, packed)
     return key, packed
 
 
@@ -199,7 +198,7 @@ def file_processing(fn, options):
 
     if not processed:
         fd.close()
-        # dot_rename(fn)
+        dot_rename(fn)
         return fn
 
     err_rate = float(errors) / processed
