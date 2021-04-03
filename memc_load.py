@@ -7,15 +7,17 @@ import glob
 import logging
 import collections
 from optparse import OptionParser
-# protoc  --python_out=. ./appsinstalled.proto
 import appsinstalled_pb2
-import pymemcache
 from multiprocessing import Pool, TimeoutError
 from threading import Thread
 from queue import Queue, Empty
 
+from memcache import Client
+
 NORMAL_ERR_RATE = 0.01
-AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
+AppsInstalled = collections.namedtuple(
+                "AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"]
+                )
 
 TIMEOUT = 0.1
 CONNECT_TIMEOUT = 5
@@ -27,15 +29,20 @@ def dot_rename(path):
     # atomic in most cases
     os.rename(path, os.path.join(head, "." + fn))
 
+
 class MemcachedThread(Thread):
-    """
+    '''
     MemcachedTread
 
     Creates the Client for a single memcached server.
-    """
-    def __init__(self, job_queue, result_queue, memc, dry_run=False, attemps = 1):
-        """
-        Constructor.
+    '''
+    def __init__(self,
+                 job_queue,
+                 result_queue,
+                 memc,
+                 dry_run=False,
+                 attemps=1):
+        '''Constructor.
 
         Args:
             job_queue: Queue
@@ -43,10 +50,7 @@ class MemcachedThread(Thread):
             memc: Memcache client
             dry_run: Store True
             attemps: attemps to restart
-        
-        Notes:
-
-        """
+        '''
         super().__init__()
         self.job_queue = job_queue
         self.result_queue = result_queue
@@ -54,19 +58,22 @@ class MemcachedThread(Thread):
         self.dry_run = dry_run
         self.attemps = attemps
 
-
     def run(self):
         '''
         Run Writer
         '''
-        logging.debug("Worker [{}] starts thread {}".format(os.getpid(), self.name))
+        logging.debug(
+            "Worker [{}] starts thread {}".format(os.getpid(), self.name)
+            )
         processed = errors = 0
         while True:
             try:
                 chunks = self.job_queue.get(timeout=0.1)
                 if chunks == SENTINEL:
                     self.result_queue.put((processed, errors))
-                    logging.info('[Worker %s] Stop thread: %s' % (os.getpid(), self.name))
+                    logging.info(
+                        '[Worker %s] stop thread:%s' % (os.getpid(), self.name)
+                        )
                     break
                 else:
                     proc_items, err_items = self.insert_appsinstalled(chunks)
@@ -74,24 +81,25 @@ class MemcachedThread(Thread):
                     errors += err_items
             except Empty:
                 continue
-        
 
     def insert_appsinstalled(self, batches):
         processed = errors = 0
         try:
             if self.dry_run:
                 for key, values in batches.items():
-                    logging.debug("{} - {} -> {}".format(self.memc, key, values))
+                    logging.debug(
+                        "{} - {} -> {}".format(self.memc, key, values)
+                        )
                     processed += 1
             else:
-                for key, value in batches.items():
-                    self.memc.set(key, value)
+                self.memc.set_multi(batches)
         except Exception as e:
-            logging.exception("Cannot write to memc {}: {}".format(self.memc.servers[0], e))
+            logging.exception(
+                "Cannot write to memc {}: {}".format(self.memc.servers[0], e)
+                )
             errors += 1
             return processed, errors
         return processed, errors
-
 
 
 def parse_appsinstalled(line):
@@ -114,6 +122,8 @@ def parse_appsinstalled(line):
 
 
 def serializeapp(appsinstalled):
+    '''serialize app
+    '''
     ua = appsinstalled_pb2.UserApps()
     ua.lat = appsinstalled.lat
     ua.lon = appsinstalled.lon
@@ -126,13 +136,19 @@ def serializeapp(appsinstalled):
 def file_processing(fn, options):
     '''
     Create thread_pool for every new task
-    Every thread exits after completing the task. 
+    Every thread exits after completing the task.
 
     To overcome the problem of so many threads, creat ehte pool of threads
-    for each task to execute execute another task when it is finished (so long as there are more tasks to run).  
+    for each task to execute execute another
+    task when it is finished (so long as there are more tasks to run).
 
-    When all tasks are done, we must tell the threads to exit. 
-    We paass in a special SENTINEL argument that is different from any argument that the caller could pass.
+    When all tasks are done, we must tell the threads to exit.
+    We paass in a special SENTINEL
+    argument that is different from any argument that the caller could pass.
+
+    Args:
+        fn (str): filename
+        options (ArgumentParser): script's options
     '''
     device_memc = {
         "idfa": options.idfa,
@@ -147,13 +163,13 @@ def file_processing(fn, options):
     chunks = {}
 
     for device_type, memc_addr in device_memc.items():
-        memc = pymemcache.Client([memc_addr], timeout=TIMEOUT)
+        memc = Client([memc_addr])
         job_pool[device_type] = Queue()
-        worker = MemcachedThread(job_pool[device_type], 
-                                result_queue,
-                                memc, 
-                                options.dry,
-                                )
+        worker = MemcachedThread(job_pool[device_type],
+                                 result_queue,
+                                 memc,
+                                 options.dry,
+                                 )
         thread_pool[device_type] = worker
         chunks[device_type] = {}
         worker.start()
@@ -175,7 +191,7 @@ def file_processing(fn, options):
             errors += 1
             logging.error("Unknow device type: %s" % appsinstalled.dev_type)
             continue
-            
+
         key, packed = serializeapp(appsinstalled)
         chunk = chunks[device_type]
         chunk[key] = packed
@@ -188,9 +204,8 @@ def file_processing(fn, options):
         queue.put(SENTINEL)
 
     for thread in thread_pool.values():
-        # to ensure that all threads have finished, call join 
         thread.join()
-    
+
     while not result_queue.empty():
         result = result_queue.get(timeout=0.1)
         processed += result[0]
@@ -203,15 +218,25 @@ def file_processing(fn, options):
 
     err_rate = float(errors) / processed
     if err_rate < NORMAL_ERR_RATE:
-        logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+        logging.info(
+            "Acceptable error rate (%s). Successfull load" % err_rate
+            )
     else:
-        logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+        logging.error(
+            "High error rate (%s > %s). Failed load" % (err_rate,
+                                                        NORMAL_ERR_RATE
+                                                        )
+            )
     fd.close()
     return fn
 
 
 def prototest():
-    sample = "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
+    '''Tets run
+    '''
+    sample = '''idfa\t1rfw452y52g2gq4g\t
+            55.55\t42.42\t1423,43,567,3,7,23\ngaid\t
+            7rfw452y52g2gq4g\t55.55\t42.42\t7423,424'''
     for line in sample.splitlines():
         dev_type, dev_id, lat, lon, raw_apps = line.strip().split("\t")
         apps = [int(a) for a in raw_apps.split(",") if a.isdigit()]
@@ -227,12 +252,13 @@ def prototest():
 
 
 def main(options):
-    '''
-    Create pool of precess which will carry out the task submitted to it
+    '''Create pool of precess which will carry out the task submitted to it
+    Args:
+        options (ArgumentParser): script's options
     '''
     with Pool(int(options.workers)) as pool:
         process_args = (
-                        (file_name, options) 
+                        (file_name, options)
                         for file_name in sorted(glob.iglob(options.pattern))
                         )
         for fn in pool.starmap(file_processing, process_args):
@@ -246,15 +272,18 @@ if __name__ == '__main__':
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
     op.add_option("--dry", action="store_true", default=False)
-    op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
+    op.add_option("--pattern", action="store",
+                               default="/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
     op.add_option("--gaid", action="store", default="127.0.0.1:33014")
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     op.add_option("--workers", action="store", default="3")
     (opts, args) = op.parse_args()
-    logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
-                        format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
+    logging.basicConfig(filename=opts.log,
+                        level=logging.INFO if not opts.dry else logging.DEBUG,
+                        format='[%(asctime)s] %(levelname).1s %(message)s',
+                        datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
         prototest()
         sys.exit(0)

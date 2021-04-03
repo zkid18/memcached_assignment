@@ -58,6 +58,10 @@ cd appsinstalled
 protoc --python_out=. appsinstalled.proto
 ```
 
+### Test run
+
+`python3 memc_load.py --pattern data/*.tsv.gz --dry  740.78s user 17.53s system 66% cpu 19:05.07 total`
+
 ## Authors
 
 * **Daniil Chepenko** 

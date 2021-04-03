@@ -1,4 +1,6 @@
 /data
 *.pdf
 /memcached_assignment
+/memcached_env
 *.pyc
+__pycache__
