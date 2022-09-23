@@ -1,2 +1,2 @@
-protobuf==3.8.0
+protobuf==3.18.3
 python-memcached==1.59
